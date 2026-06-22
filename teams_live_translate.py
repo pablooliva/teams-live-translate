@@ -1,29 +1,39 @@
 #!/usr/bin/env python3
-"""Live-translate incoming Teams audio into a target language.
+"""Live-translate audio into a target language, as speech and/or as captions.
 
-Captures audio from a (virtual) input device — typically BlackHole (macOS) or
-VB-CABLE (Windows), which you set as Teams' speaker output — streams it to
-Google's Gemini 3.5 Live Translate model over a WebSocket, and plays the
-translated speech back to your real headphones.
+Two modes, sharing one Gemini 3.5 Live Translate pipeline:
 
-One-directional and listen-only: it translates what you HEAR. It does not touch
-your microphone or inject anything back into the meeting.
+* Listen mode (default): captures audio from a (virtual) input device — typically
+  BlackHole (macOS) or VB-CABLE (Windows) set as Teams' speaker output — streams
+  it to Google's Live Translate model, and plays the translated speech back to your
+  headphones. Listen-only: it translates what you HEAR.
 
-The Live Translate API requires a fixed audio format (16 kHz mono in, 24 kHz
-mono out). Real devices rarely run at those rates — virtual cables are usually
-44.1/48 kHz stereo. So this script auto-detects each device's native rate and
-channel count, downmixes to mono, and resamples to/from the API rates with soxr.
-That makes it robust across macOS (CoreAudio) and Windows (WASAPI/MME), where
-sample-rate handling differs.
+* Captions mode (--captions): captures your MICROPHONE, and writes the translated
+  text (and optionally the original source text) to files that OBS can read with a
+  "Text (read from file)" source. Point OBS's Virtual Camera at Teams and your
+  audience sees live captions of what you say. Audio playback is off by default in
+  this mode (you don't want to hear your own translated voice).
 
-Config is read from the environment (see .env.example) and can be overridden on
-the command line. Run with --list-devices first to find your device names.
+The target language can be changed on the fly with --switch: the Live API config
+is immutable per connection, so a language change cleanly closes the session and
+reopens it with the new target. That same reconnect loop also rides through the
+API's ~15-minute audio-session cap automatically.
+
+The Live Translate API requires a fixed audio format (16 kHz mono in, 24 kHz mono
+out). Real devices rarely run at those rates, so this script auto-detects each
+device's native rate/channels, downmixes to mono, and resamples with soxr — robust
+across macOS (CoreAudio) and Windows (WASAPI/MME).
+
+Config is read from the environment (see .env.example) and can be overridden on the
+command line. Run with --list-devices first to find your device names.
 """
 
 import argparse
 import asyncio
+import contextlib
 import os
 import queue
+import sys
 import threading
 
 import numpy as np
@@ -43,7 +53,7 @@ SAMPLE_BYTES = 2
 MODEL = "gemini-3.5-live-translate-preview"
 
 # --- Shared buffers between the audio threads and the asyncio loop --------
-# Mic callback pushes captured (native-rate, native-channel) bytes here.
+# Input callback pushes captured (native-rate, native-channel) bytes here.
 _capture_q: "queue.Queue[bytes]" = queue.Queue()
 # Receiver appends playback-ready (native-rate, native-channel) bytes here.
 _play_buf = bytearray()
@@ -95,6 +105,72 @@ class PlaybackDecoder:
         return a.tobytes()
 
 
+class CaptionWriter:
+    """Writes live transcripts to plain text files for OBS "read from file" sources.
+
+    Two files in `directory`:
+      translation.txt - the translated caption (always)
+      source.txt      - the original-language transcript (only when bilingual)
+
+    Transcripts arrive as a stream of fragments per utterance. We accumulate the
+    current utterance and rewrite the file on each fragment, so OBS shows it
+    building in real time. On turn completion we reset the buffers but leave the
+    files showing the last utterance, so the caption stays on screen until the
+    next utterance overwrites it.
+    """
+
+    TRANSLATION_FILE = "translation.txt"
+    SOURCE_FILE = "source.txt"
+
+    def __init__(self, directory: str, bilingual: bool):
+        self.bilingual = bilingual
+        os.makedirs(directory, exist_ok=True)
+        self.dst_path = os.path.join(directory, self.TRANSLATION_FILE)
+        self.src_path = os.path.join(directory, self.SOURCE_FILE)
+        self.src_buf = ""
+        self.dst_buf = ""
+        self._write(self.dst_path, "")
+        if bilingual:
+            self._write(self.src_path, "")
+
+    @staticmethod
+    def _write(path: str, text: str) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def add_source(self, text: str) -> None:
+        if not self.bilingual:
+            return
+        self.src_buf += text
+        self._write(self.src_path, self.src_buf)
+
+    def add_translation(self, text: str) -> None:
+        self.dst_buf += text
+        self._write(self.dst_path, self.dst_buf)
+
+    def end_turn(self) -> None:
+        # Keep the files as-is (last utterance stays visible); start fresh so the
+        # next utterance's first fragment overwrites it instead of appending.
+        self.src_buf = ""
+        self.dst_buf = ""
+
+
+class Controller:
+    """Shared control state between the stdin reader thread and the asyncio loop."""
+
+    def __init__(self, target: str):
+        self.target = target
+        self.switch = asyncio.Event()  # set when the target language changes
+        self.stop = asyncio.Event()    # set to quit
+
+    def request_switch(self, new_target: str) -> None:
+        self.target = new_target
+        self.switch.set()
+
+    def request_stop(self) -> None:
+        self.stop.set()
+
+
 def _in_callback(indata, frames, time_info, status):
     """PortAudio thread: copy captured native PCM into the capture queue."""
     if status:
@@ -115,11 +191,28 @@ def _out_callback(outdata, frames, time_info, status):
         outdata[avail:] = b"\x00" * (need - avail)
 
 
+def _drain_capture_queue() -> None:
+    """Discard backlogged audio so a fresh session doesn't start seconds behind."""
+    try:
+        while True:
+            _capture_q.get_nowait()
+    except queue.Empty:
+        pass
+
+
 async def _sender(session, encode: CaptureEncoder):
-    """Pump captured mic chunks into the Live session (downmixed + resampled)."""
+    """Pump captured chunks into the Live session (downmixed + resampled).
+
+    The queue read uses a short timeout so the executor thread returns promptly:
+    that keeps cancellation clean on reconnect and prevents orphaned threads from
+    accumulating and stealing audio across sessions.
+    """
     loop = asyncio.get_running_loop()
     while True:
-        raw = await loop.run_in_executor(None, _capture_q.get)
+        try:
+            raw = await loop.run_in_executor(None, _capture_q.get, True, 0.1)
+        except queue.Empty:
+            continue
         chunk = encode(raw)
         if chunk:
             await session.send_realtime_input(
@@ -127,21 +220,40 @@ async def _sender(session, encode: CaptureEncoder):
             )
 
 
-async def _receiver(session, decode: PlaybackDecoder, show_transcript: bool):
-    """Receive translated audio, resample for the device, and queue it for playback."""
-    while True:
-        async for response in session.receive():
-            sc = getattr(response, "server_content", None)
-            if not sc:
-                continue
-            if sc.model_turn:
-                for part in sc.model_turn.parts:
-                    if part.inline_data and part.inline_data.data:
-                        pcm = decode(part.inline_data.data)
-                        with _play_lock:
-                            _play_buf.extend(pcm)
-            if show_transcript and sc.output_transcription and sc.output_transcription.text:
-                print(sc.output_transcription.text, end="", flush=True)
+async def _receiver(session, decode, caption, show_transcript: bool):
+    """Receive translated audio + transcripts; play audio and/or write captions.
+
+    Returns when the session ends (server close / 15-min cap), which the run loop
+    treats as a signal to reconnect.
+    """
+    async for response in session.receive():
+        sc = getattr(response, "server_content", None)
+        if not sc:
+            continue
+        if decode is not None and sc.model_turn:
+            for part in sc.model_turn.parts:
+                if part.inline_data and part.inline_data.data:
+                    pcm = decode(part.inline_data.data)
+                    with _play_lock:
+                        _play_buf.extend(pcm)
+        # The source-transcript field has been seen under both names across API
+        # versions; accept either so bilingual mode is resilient.
+        in_tx = getattr(sc, "input_transcription", None) or getattr(
+            sc, "input_audio_transcription", None
+        )
+        if in_tx and in_tx.text and caption is not None:
+            caption.add_source(in_tx.text)
+        out_tx = getattr(sc, "output_transcription", None)
+        if out_tx and out_tx.text:
+            if caption is not None:
+                caption.add_translation(out_tx.text)
+            if show_transcript:
+                print(out_tx.text, end="", flush=True)
+        if getattr(sc, "turn_complete", False):
+            if caption is not None:
+                caption.end_turn()
+            if show_transcript:
+                print(flush=True)
 
 
 def _device_format(device, kind: str):
@@ -149,7 +261,7 @@ def _device_format(device, kind: str):
 
     `device` may be None (system default), an int index, or a name substring.
     Channels are capped at 2 to keep downmix/fan-out simple and to match the
-    typical mix format of virtual cables and headphones.
+    typical mix format of mics, virtual cables and headphones.
     """
     info = sd.query_devices(device, kind)
     rate = int(round(info["default_samplerate"]))
@@ -158,29 +270,58 @@ def _device_format(device, kind: str):
     return rate, channels
 
 
-async def run(args):
-    # genai.Client() automatically reads GEMINI_API_KEY or GOOGLE_API_KEY.
-    client = genai.Client()
-
-    config = types.LiveConnectConfig(
-        response_modalities=["AUDIO"],
+def _build_config(target: str, echo: bool) -> types.LiveConnectConfig:
+    return types.LiveConnectConfig(
+        response_modalities=["AUDIO"],  # Live Translate is audio-only; text comes via transcription.
         input_audio_transcription=types.AudioTranscriptionConfig(),
         output_audio_transcription=types.AudioTranscriptionConfig(),
         translation_config=types.TranslationConfig(
             # Target language is fully configurable (BCP-47 code, e.g. "de", "es").
-            target_language_code=args.target,
-            # Source language is AUTO-DETECTED by the model (70+ languages, even
-            # mixed within one meeting). The preview API exposes no source-language
-            # override, so args.source is informational only — kept so the wiring
-            # is ready if Google adds the field later.
-            echo_target_language=args.echo,
+            target_language_code=target,
+            # Source language is AUTO-DETECTED by the model (70+ languages). The
+            # preview API exposes no source-language override, so args.source is
+            # informational only — kept so the wiring is ready if Google adds it.
+            echo_target_language=echo,
         ),
     )
 
+
+def _start_control_thread(loop: asyncio.AbstractEventLoop, controller: Controller) -> None:
+    """Daemon thread: read language-switch commands from stdin.
+
+    Type a BCP-47 code (e.g. "es") + Enter to switch target language; "q" to quit.
+    Daemon so it never blocks process exit while parked on a blocking read.
+    """
+    def reader():
+        for line in sys.stdin:
+            cmd = line.strip()
+            if not cmd:
+                continue
+            if cmd.lower() in ("q", "quit", "exit"):
+                loop.call_soon_threadsafe(controller.request_stop)
+                return
+            loop.call_soon_threadsafe(controller.request_switch, cmd)
+            print(f"[switching -> {cmd}]", flush=True)
+
+    threading.Thread(target=reader, daemon=True).start()
+
+
+async def run(args):
+    # genai.Client() automatically reads GEMINI_API_KEY or GOOGLE_API_KEY.
+    client = genai.Client()
+    controller = Controller(args.target)
+
     in_rate, in_ch = _device_format(args.input_device, "input")
-    out_rate, out_ch = _device_format(args.output_device, "output")
     encode = CaptureEncoder(in_rate, in_ch)
-    decode = PlaybackDecoder(out_rate, out_ch)
+
+    decode = None
+    out_stream = None
+    out_rate = out_ch = None
+    if args.playback:
+        out_rate, out_ch = _device_format(args.output_device, "output")
+        decode = PlaybackDecoder(out_rate, out_ch)
+
+    caption = CaptionWriter(args.caption_dir, args.bilingual) if args.captions else None
 
     in_stream = sd.RawInputStream(
         samplerate=in_rate,
@@ -190,30 +331,79 @@ async def run(args):
         device=args.input_device,
         callback=_in_callback,
     )
-    out_stream = sd.RawOutputStream(
-        samplerate=out_rate,
-        blocksize=0,
-        dtype=DTYPE,
-        channels=out_ch,
-        device=args.output_device,
-        callback=_out_callback,
-    )
+    if args.playback:
+        out_stream = sd.RawOutputStream(
+            samplerate=out_rate,
+            blocksize=0,
+            dtype=DTYPE,
+            channels=out_ch,
+            device=args.output_device,
+            callback=_out_callback,
+        )
+
+    if args.switch:
+        _start_control_thread(asyncio.get_running_loop(), controller)
 
     src = args.source or "auto-detect"
-    print(
-        f"Translating {src} -> {args.target}\n"
-        f"  in : {args.input_device or 'default'} @ {in_rate} Hz / {in_ch}ch -> {IN_RATE} Hz mono\n"
-        f"  out: {args.output_device or 'default'} @ {OUT_RATE} Hz mono -> {out_rate} Hz / {out_ch}ch\n"
-        f"Ctrl-C to stop.\n",
-        flush=True,
-    )
+    mode = "captions" if args.captions else "listen"
+    lines = [
+        f"Mode: {mode}   Translating {src} -> {args.target}",
+        f"  in : {args.input_device or 'default (mic)'} @ {in_rate} Hz / {in_ch}ch -> {IN_RATE} Hz mono",
+    ]
+    if args.playback:
+        lines.append(
+            f"  out: {args.output_device or 'default'} @ {OUT_RATE} Hz mono -> {out_rate} Hz / {out_ch}ch"
+        )
+    else:
+        lines.append("  out: audio playback OFF")
+    if caption is not None:
+        kind = "bilingual (source + translation)" if args.bilingual else "translation only"
+        lines.append(f"  captions: {os.path.abspath(args.caption_dir)}  ({kind})")
+    if args.switch:
+        lines.append("  switch: type a language code + Enter to change target, 'q' to quit")
+    lines.append("Ctrl-C to stop.\n")
+    print("\n".join(lines), flush=True)
 
-    with in_stream, out_stream:
-        async with client.aio.live.connect(model=MODEL, config=config) as session:
-            await asyncio.gather(
-                _sender(session, encode),
-                _receiver(session, decode, show_transcript=args.transcript),
-            )
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(in_stream)
+        if out_stream is not None:
+            stack.enter_context(out_stream)
+
+        # Reconnect loop: one iteration per Live session. A new session starts on
+        # language switch or after the server closes the connection (~15-min cap).
+        while not controller.stop.is_set():
+            controller.switch.clear()
+            target = controller.target
+            _drain_capture_queue()
+            config = _build_config(target, args.echo)
+            try:
+                async with client.aio.live.connect(model=MODEL, config=config) as session:
+                    print(f"[connected -> {target}]", flush=True)
+                    tasks = {
+                        asyncio.create_task(_sender(session, encode)),
+                        asyncio.create_task(
+                            _receiver(session, decode, caption, args.transcript)
+                        ),
+                        asyncio.create_task(controller.switch.wait()),
+                        asyncio.create_task(controller.stop.wait()),
+                    }
+                    done, pending = await asyncio.wait(
+                        tasks, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for t in pending:
+                        t.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    for t in done:
+                        exc = t.exception()
+                        if exc and not isinstance(exc, asyncio.CancelledError):
+                            print(f"[session ended: {exc!r}]", flush=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - any connection error -> reconnect
+                if controller.stop.is_set():
+                    break
+                print(f"[reconnecting after error: {exc!r}]", flush=True)
+                await asyncio.sleep(0.5)
 
 
 def parse_args():
@@ -233,8 +423,8 @@ def parse_args():
     p.add_argument(
         "--input-device",
         default=os.environ.get("INPUT_DEVICE") or None,
-        help="Capture device name or index (env INPUT_DEVICE). "
-        "Set to BlackHole (macOS) or 'CABLE Output' (Windows).",
+        help="Capture device name or index (env INPUT_DEVICE). Leave unset to use "
+        "your default mic (captions mode), or set to BlackHole / 'CABLE Output' (listen mode).",
     )
     p.add_argument(
         "--output-device",
@@ -248,6 +438,36 @@ def parse_args():
         help="Output audio even when input already matches the target language (default on).",
     )
     p.add_argument("--transcript", action="store_true", help="Print the translated transcript to stdout")
+    # --- Captions mode -----------------------------------------------------
+    p.add_argument(
+        "--captions",
+        action="store_true",
+        help="Write live transcripts to text files for an OBS 'read from file' source.",
+    )
+    p.add_argument(
+        "--caption-dir",
+        default=os.environ.get("CAPTION_DIR", "captions"),
+        help="Directory for caption files (env CAPTION_DIR). Default: ./captions",
+    )
+    p.add_argument(
+        "--bilingual",
+        action="store_true",
+        help="Also write the original source transcript (source.txt) alongside translation.txt.",
+    )
+    # Playback default: ON in listen mode, OFF in captions mode (resolved in main()).
+    p.add_argument(
+        "--playback", dest="playback", action="store_true", default=None,
+        help="Play translated audio (default: on in listen mode, off in captions mode).",
+    )
+    p.add_argument(
+        "--no-playback", dest="playback", action="store_false",
+        help="Disable translated-audio playback.",
+    )
+    p.add_argument(
+        "--switch",
+        action="store_true",
+        help="Enable on-the-fly target-language switching: type a code + Enter (reconnects).",
+    )
     return p.parse_args()
 
 
@@ -256,6 +476,9 @@ def main():
     if args.list_devices:
         print(sd.query_devices())
         return
+    # Playback defaults to off in captions mode, on otherwise, unless set explicitly.
+    if args.playback is None:
+        args.playback = not args.captions
     # Coerce numeric device strings ("3") to int indices, which sounddevice prefers.
     for attr in ("input_device", "output_device"):
         val = getattr(args, attr)

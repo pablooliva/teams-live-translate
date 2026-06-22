@@ -4,9 +4,19 @@ Translate whatever audio is coming through Microsoft Teams into a target
 language of your choice, in near-real-time spoken audio, using Google's
 **Gemini 3.5 Live Translate** model.
 
-Listen-only and one-directional: it translates what you *hear*. It never touches
-your microphone or sends anything into the meeting. The source language is
-auto-detected (70+ languages); the target language is configurable.
+It has two modes:
+
+- **Listen mode** (default) — translates what you *hear*. It captures Teams audio
+  via a virtual device and plays the translation to your headphones. Listen-only
+  and one-directional: it never touches your microphone or sends anything into the
+  meeting.
+- **Captions mode** (`--captions`) — translates what you *say*. It captures your
+  microphone and writes the translated text (and optionally the original) to files
+  that [OBS](https://obsproject.com/) reads, so you can present with live translated
+  captions baked into your Teams video. See [Captions mode](#captions-mode-presenting-with-live-captions).
+
+The source language is auto-detected (70+ languages); the target language is
+configurable and can be **changed on the fly** while running (`--switch`).
 
 Runs on **macOS and Windows** — same script, same commands; only the virtual
 audio device differs.
@@ -118,6 +128,70 @@ uv run --env-file .env teams-live-translate \
 > On Windows PowerShell the `\` line-continuations above won't work — put it all
 > on one line, or use a backtick (`` ` ``) for continuation.
 
+## Captions mode (presenting with live captions)
+
+Use this when *you* are presenting and want your audience to read live translated
+captions of what you say. It captures your **microphone** (no device config needed
+— it uses your default input), translates it, and writes the text to files that OBS
+displays and pipes into Teams as a virtual camera.
+
+Audio playback is **off** by default in this mode (you don't want to hear your own
+translated voice, and it would feed back into the mic).
+
+```sh
+# Speak English, caption in Spanish, with on-the-fly language switching:
+uv run --env-file .env teams-live-translate --captions --switch --target es
+
+# Bilingual — also write the original (source) line:
+uv run --env-file .env teams-live-translate --captions --bilingual --switch --target es
+```
+
+Caption text is written to `./captions/` (override with `--caption-dir`):
+
+- `translation.txt` — the translated caption (always)
+- `source.txt` — the original transcript (only with `--bilingual`)
+
+### Switching language while running
+
+With `--switch`, type a target language [BCP-47 code](https://en.wikipedia.org/wiki/IETF_language_tag)
+(e.g. `de`, `fr`, `ja`) and press **Enter** to switch; type `q` to quit. Because the
+Live API fixes the target language when the connection opens, a switch transparently
+reconnects with the new language — a ~1-second gap, then captions resume. (That same
+reconnect logic also rides through the API's ~15-minute session cap automatically.)
+
+### OBS setup (one-time)
+
+1. **Add a caption source.** In OBS: **Sources → + → Text (GDI+)** on Windows, or
+   **Text (FreeType 2)** on macOS. Tick **"Read from file"** and point it at
+   `captions/translation.txt`. Style the font, size, and outline. OBS re-reads the
+   file automatically, so captions update live as you speak.
+   - For `--bilingual`, add a **second** Text source pointing at `captions/source.txt`
+     and position it above the translation.
+2. **Start the virtual camera.** OBS: **Controls → Start Virtual Camera.**
+3. **Select it in Teams.** Teams → **Settings → Devices → Camera** = `OBS Virtual
+   Camera`. Your audience now sees the captions composited into your video feed.
+
+> Teams won't let you inject text into its own native caption bar, so OBS renders
+> your captions instead — which also gives you full control over styling and
+> placement.
+
+## Flags
+
+| Flag | Description |
+|------|-------------|
+| `--list-devices` | List audio devices and exit. |
+| `--target <code>` | Target language BCP-47 code (env `TARGET_LANGUAGE`). Default `de`. |
+| `--source <code>` | Source-language hint (env `SOURCE_LANGUAGE`). Informational only — the model auto-detects. |
+| `--input-device <name\|index>` | Capture device (env `INPUT_DEVICE`). Unset = default mic (captions mode); set to BlackHole / `CABLE Output` (listen mode). |
+| `--output-device <name\|index>` | Playback device (env `OUTPUT_DEVICE`) — your headphones. |
+| `--transcript` | Print the translated transcript to stdout. |
+| `--captions` | Captions mode: capture the mic and write transcripts to files for OBS. |
+| `--caption-dir <dir>` | Directory for caption files (env `CAPTION_DIR`). Default `./captions`. |
+| `--bilingual` | Also write the original source transcript (`source.txt`). |
+| `--switch` | Enable on-the-fly target-language switching (type a code + Enter; `q` to quit). |
+| `--playback` / `--no-playback` | Force translated-audio playback on/off. Default: on in listen mode, off in captions mode. |
+| `--echo` | Output audio even when the input already matches the target language (default on). |
+
 ## Notes & limits
 
 - **Latency:** the model stays a few seconds behind the speaker by design (it
@@ -126,5 +200,11 @@ uv run --env-file .env teams-live-translate \
 - **Cost:** ~$0.023/min of audio (~$1.38/hour).
 - **Preview:** `gemini-3.5-live-translate-preview` is a public-preview model; the
   API surface may change.
+- **Captions still synthesize audio:** the model is audio-only (text comes from its
+  transcription side-channel), so captions mode generates translated speech it then
+  discards. Harmless, but if you only ever want text, a dedicated streaming
+  speech-to-text + translation path would be leaner.
+- **15-minute sessions:** the API caps an audio session at ~15 minutes; the script
+  reconnects automatically (a ~1-second gap), so long presentations just work.
 - **Sample rates / channels:** handled automatically (auto-detect + soxr
   resampling), so you shouldn't hit format-mismatch errors on either OS.
