@@ -105,6 +105,64 @@ class PlaybackDecoder:
         return a.tobytes()
 
 
+class _RollUp:
+    """A fixed-width, fixed-height roll-up window for one caption file.
+
+    Streamed transcript fragments are appended with add(); the buffer greedily
+    word-wraps them to `width` columns. A line is *committed* (frozen) the instant
+    it fills, so it never re-wraps afterward — only the bottom line is still
+    "live" and growing. render() always returns exactly `height` rows, newest at
+    the bottom and blank-padded at the top.
+
+    The point of the constant width + constant height: OBS re-reads and re-renders
+    the whole file on every fragment. If the text could re-wrap or change line
+    count, OBS would reflow the entire block and the caption would jitter with no
+    stable reference point. Here, finished lines never move and the block is always
+    the same size, so the live line sits at a fixed bottom position and completed
+    lines scroll up exactly one row at a time — broadcast/TV-caption style.
+    """
+
+    def __init__(self, width: int, height: int):
+        self.width = max(1, width)
+        self.height = max(1, height)
+        self.committed: list[str] = []  # frozen, already-wrapped lines
+        self.current = ""               # the live bottom line, still growing
+
+    def add(self, text: str) -> None:
+        # The model occasionally emits its own newlines/tabs mid-stream; fold them
+        # into spaces so they don't defeat our wrapping. (We keep the ordinary
+        # single spaces between fragments — those are what separate the words.)
+        self.current += text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+        self._wrap()
+
+    def end_turn(self) -> None:
+        # An utterance just ended. Don't break the line — the roll-up flow simply
+        # continues — but make sure the next utterance can't glue onto the last
+        # word if its first fragment lacks a leading space.
+        if self.current and not self.current.endswith(" "):
+            self.current += " "
+
+    def _wrap(self) -> None:
+        while len(self.current) > self.width:
+            cut = self.current.rfind(" ", 0, self.width + 1)
+            if cut <= 0:  # a single word longer than a line: hard-break it
+                head, self.current = self.current[: self.width], self.current[self.width :]
+            else:
+                head, self.current = self.current[:cut], self.current[cut + 1 :]
+            self.committed.append(head.rstrip())
+        # We only ever display the last `height` rows, so keep memory bounded.
+        if len(self.committed) > self.height:
+            self.committed = self.committed[-self.height :]
+
+    def render(self) -> str:
+        rows = (self.committed + [self.current])[-self.height :]
+        # Pad the top with blank rows so the block is always exactly `height` lines
+        # tall and the live line stays pinned to the bottom. A single space (not an
+        # empty string) guarantees OBS gives each pad row a full line of height.
+        rows = [" "] * (self.height - len(rows)) + rows
+        return "\n".join(rows)
+
+
 class CaptionWriter:
     """Writes live transcripts to plain text files for OBS "read from file" sources.
 
@@ -112,63 +170,58 @@ class CaptionWriter:
       translation.txt - the translated caption (always)
       source.txt      - the original-language transcript (only when bilingual)
 
-    Transcripts arrive as a stream of fragments per utterance. We accumulate the
-    current utterance and rewrite the file on each fragment, so OBS shows it
-    building in real time. On turn completion we reset the buffers but leave the
-    files showing the last utterance, so the caption stays on screen until the
-    next utterance overwrites it.
+    Each file is a roll-up window (see _RollUp): fragments are word-wrapped to a
+    fixed column width and shown as a fixed number of rows, newest at the bottom.
+    Finished lines never re-wrap and the block is always the same height, so OBS
+    renders a stable caption that scrolls up one line at a time as you speak,
+    instead of reflowing the whole block on every fragment.
     """
 
     TRANSLATION_FILE = "translation.txt"
     SOURCE_FILE = "source.txt"
-    # Default rolling-window size (characters); override per run via the max_chars
-    # arg (env CAPTION_CHARS / --caption-chars). Only the last N characters are
-    # written to the caption files, so a long continuous utterance scrolls (oldest
-    # text falls off the front) instead of growing off-screen. Smaller = fewer
-    # on-screen lines. Trimmed at a word boundary so it never starts mid-word.
-    DEFAULT_MAX_CHARS = 130
+    # Default roll-up geometry; override per run via the width/lines args
+    # (env CAPTION_WIDTH / CAPTION_LINES, or --caption-width / --caption-lines).
+    #   width = characters per line — match your OBS text-box width / font size
+    #   lines = number of visible rows (the roll-up depth)
+    DEFAULT_WIDTH = 42
+    DEFAULT_LINES = 3
 
-    def __init__(self, directory: str, bilingual: bool, max_chars: int = DEFAULT_MAX_CHARS):
+    def __init__(
+        self,
+        directory: str,
+        bilingual: bool,
+        width: int = DEFAULT_WIDTH,
+        lines: int = DEFAULT_LINES,
+    ):
         self.bilingual = bilingual
-        self.max_chars = max_chars
         os.makedirs(directory, exist_ok=True)
         self.dst_path = os.path.join(directory, self.TRANSLATION_FILE)
         self.src_path = os.path.join(directory, self.SOURCE_FILE)
-        self.src_buf = ""
-        self.dst_buf = ""
-        self._write(self.dst_path, "")
+        self.dst = _RollUp(width, lines)
+        self.src = _RollUp(width, lines)
+        self._write(self.dst_path, self.dst.render())
         if bilingual:
-            self._write(self.src_path, "")
+            self._write(self.src_path, self.src.render())
 
     @staticmethod
     def _write(path: str, text: str) -> None:
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
 
-    def _tail(self, text: str) -> str:
-        """Last max_chars chars, starting at a word boundary so the rolling
-        window never begins mid-word."""
-        if len(text) <= self.max_chars:
-            return text
-        clipped = text[-self.max_chars:]
-        space = clipped.find(" ")
-        return clipped[space + 1:] if space != -1 else clipped
-
     def add_source(self, text: str) -> None:
         if not self.bilingual:
             return
-        self.src_buf += text
-        self._write(self.src_path, self._tail(self.src_buf))
+        self.src.add(text)
+        self._write(self.src_path, self.src.render())
 
     def add_translation(self, text: str) -> None:
-        self.dst_buf += text
-        self._write(self.dst_path, self._tail(self.dst_buf))
+        self.dst.add(text)
+        self._write(self.dst_path, self.dst.render())
 
     def end_turn(self) -> None:
-        # Keep the files as-is (last utterance stays visible); start fresh so the
-        # next utterance's first fragment overwrites it instead of appending.
-        self.src_buf = ""
-        self.dst_buf = ""
+        self.dst.end_turn()
+        if self.bilingual:
+            self.src.end_turn()
 
 
 class Controller:
@@ -338,7 +391,9 @@ async def run(args):
         decode = PlaybackDecoder(out_rate, out_ch)
 
     caption = (
-        CaptionWriter(args.caption_dir, args.bilingual, args.caption_chars)
+        CaptionWriter(
+            args.caption_dir, args.bilingual, args.caption_width, args.caption_lines
+        )
         if args.captions
         else None
     )
@@ -479,11 +534,18 @@ def parse_args():
         help="Directory for caption files (env CAPTION_DIR). Default: ./captions",
     )
     p.add_argument(
-        "--caption-chars",
+        "--caption-width",
         type=int,
-        default=int(os.environ.get("CAPTION_CHARS") or CaptionWriter.DEFAULT_MAX_CHARS),
-        help="Rolling caption window size in characters (env CAPTION_CHARS). "
-        "Smaller = fewer on-screen lines. Default: 130",
+        default=int(os.environ.get("CAPTION_WIDTH") or CaptionWriter.DEFAULT_WIDTH),
+        help="Caption line width in characters (env CAPTION_WIDTH). Match it to your "
+        "OBS text-box width / font size so a full line just fits. Default: 42",
+    )
+    p.add_argument(
+        "--caption-lines",
+        type=int,
+        default=int(os.environ.get("CAPTION_LINES") or CaptionWriter.DEFAULT_LINES),
+        help="Number of visible caption lines, i.e. the roll-up depth (env "
+        "CAPTION_LINES). Default: 3",
     )
     p.add_argument(
         "--bilingual",

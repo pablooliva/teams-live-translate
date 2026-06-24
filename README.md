@@ -133,7 +133,8 @@ uv run --env-file .env teams-live-translate \
 Use this when *you* are presenting and want your audience to read live translated
 captions of what you say. It captures your **microphone** (no device config needed
 — it uses your default input), translates it, and writes the text to files that OBS
-displays and pipes into Teams as a virtual camera.
+displays — which you then bring into your Teams call, either by screen-sharing an
+OBS projector (recommended for presenting) or as a virtual camera.
 
 Audio playback is **off** by default in this mode (you don't want to hear your own
 translated voice, and it would feed back into the mic).
@@ -167,9 +168,39 @@ reconnect logic also rides through the API's ~15-minute session cap automaticall
    file automatically, so captions update live as you speak.
    - For `--bilingual`, add a **second** Text source pointing at `captions/source.txt`
      and position it above the translation.
-2. **Start the virtual camera.** OBS: **Controls → Start Virtual Camera.**
-3. **Select it in Teams.** Teams → **Settings → Devices → Camera** = `OBS Virtual
-   Camera`. Your audience now sees the captions composited into your video feed.
+2. **Pin the caption to a fixed-width column — this is what stops the jitter.**
+   Why it matters: by default OBS resizes the text source to its content on *every*
+   update, so a center/bottom-anchored caption re-positions on every word — constant
+   drift. The script already keeps the *height* fixed (it always writes exactly
+   `--caption-lines` rows, blank-padded) and pre-wraps text to `--caption-width`
+   columns so finished lines never re-wrap; you just need OBS to stop resizing the
+   *width*. The control differs by renderer:
+   - **macOS — Text (FreeType 2):** set **"Custom text width"** to the pixel width
+     you want the caption column to be (this reserves a fixed width and caps
+     wrapping). Leave **"Word Wrap"** on. Leave **"Chat log mode"** *off* — it's
+     OBS's own scrolling-caption feature and would compete with the roll-up the
+     script produces.
+   - **Windows — Text (GDI+):** enable **"Use custom text extents"** and set an
+     explicit **Width** and **Height**, with **Alignment = Left**, vertical **Top**.
+   The result either way: a roll-up caption that scrolls up one line at a time with
+   a stable bottom line, instead of reflowing the whole block on every fragment.
+   - **Tune the fit:** keep `--caption-width` (characters) small enough that one
+     full line stays *narrower* than your box's pixel width at your font size — then
+     OBS never adds a wrap of its own. If lines look double-wrapped, `--caption-width`
+     is too large for the box; lower it (or widen the box). Set `--caption-lines`
+     (and, on GDI+, the box Height) to the number of rows you want visible.
+3. **Get OBS into the Teams call.** Two ways, depending on what you're presenting:
+   - **Screen-share an OBS projector (recommended).** Right-click the OBS preview →
+     **Windowed Projector (Preview)** (or **Fullscreen Projector (Preview)** if you
+     have a spare display), then in Teams use **Share content** and pick that
+     projector window/screen. Your whole OBS scene lands on Teams' large
+     content-share stage, so what you're presenting *plus* the captions get full
+     real estate. Your webcam tile is left untouched.
+   - **Virtual camera (captions over your face).** OBS: **Controls → Start Virtual
+     Camera**, then Teams → **Settings → Devices → Camera** = `OBS Virtual Camera`.
+     The catch: your entire OBS scene *becomes* your camera feed, so it's confined
+     to the small webcam tile — anything you're presenting inside OBS is shrunk down
+     with it. Fine for captions-over-talking-head, too cramped for slides or a demo.
 
 > Teams won't let you inject text into its own native caption bar, so OBS renders
 > your captions instead — which also gives you full control over styling and
@@ -187,7 +218,8 @@ reconnect logic also rides through the API's ~15-minute session cap automaticall
 | `--transcript` | Print the translated transcript to stdout. |
 | `--captions` | Captions mode: capture the mic and write transcripts to files for OBS. |
 | `--caption-dir <dir>` | Directory for caption files (env `CAPTION_DIR`). Default `./captions`. |
-| `--caption-chars <n>` | Rolling caption window size in characters (env `CAPTION_CHARS`). Smaller = fewer on-screen lines. Default `130`. |
+| `--caption-width <n>` | Caption line width in characters (env `CAPTION_WIDTH`). Match it to your OBS text-box width / font size so a full line just fits. Default `42`. |
+| `--caption-lines <n>` | Number of visible caption lines — the roll-up depth (env `CAPTION_LINES`). Default `3`. |
 | `--bilingual` | Also write the original source transcript (`source.txt`). |
 | `--switch` | Enable on-the-fly target-language switching (type a code + Enter; `q` to quit). |
 | `--playback` / `--no-playback` | Force translated-audio playback on/off. Default: on in listen mode, off in captions mode. |
