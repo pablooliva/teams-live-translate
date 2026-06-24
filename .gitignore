@@ -4,3 +4,7 @@ __pycache__/
 .env
 
 scratch.md
+captions/
+
+# Personal launcher scripts (device names, target language, etc.)
+*.local.sh

@@ -121,9 +121,16 @@ class CaptionWriter:
 
     TRANSLATION_FILE = "translation.txt"
     SOURCE_FILE = "source.txt"
+    # Default rolling-window size (characters); override per run via the max_chars
+    # arg (env CAPTION_CHARS / --caption-chars). Only the last N characters are
+    # written to the caption files, so a long continuous utterance scrolls (oldest
+    # text falls off the front) instead of growing off-screen. Smaller = fewer
+    # on-screen lines. Trimmed at a word boundary so it never starts mid-word.
+    DEFAULT_MAX_CHARS = 130
 
-    def __init__(self, directory: str, bilingual: bool):
+    def __init__(self, directory: str, bilingual: bool, max_chars: int = DEFAULT_MAX_CHARS):
         self.bilingual = bilingual
+        self.max_chars = max_chars
         os.makedirs(directory, exist_ok=True)
         self.dst_path = os.path.join(directory, self.TRANSLATION_FILE)
         self.src_path = os.path.join(directory, self.SOURCE_FILE)
@@ -138,15 +145,24 @@ class CaptionWriter:
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
 
+    def _tail(self, text: str) -> str:
+        """Last max_chars chars, starting at a word boundary so the rolling
+        window never begins mid-word."""
+        if len(text) <= self.max_chars:
+            return text
+        clipped = text[-self.max_chars:]
+        space = clipped.find(" ")
+        return clipped[space + 1:] if space != -1 else clipped
+
     def add_source(self, text: str) -> None:
         if not self.bilingual:
             return
         self.src_buf += text
-        self._write(self.src_path, self.src_buf)
+        self._write(self.src_path, self._tail(self.src_buf))
 
     def add_translation(self, text: str) -> None:
         self.dst_buf += text
-        self._write(self.dst_path, self.dst_buf)
+        self._write(self.dst_path, self._tail(self.dst_buf))
 
     def end_turn(self) -> None:
         # Keep the files as-is (last utterance stays visible); start fresh so the
@@ -321,7 +337,11 @@ async def run(args):
         out_rate, out_ch = _device_format(args.output_device, "output")
         decode = PlaybackDecoder(out_rate, out_ch)
 
-    caption = CaptionWriter(args.caption_dir, args.bilingual) if args.captions else None
+    caption = (
+        CaptionWriter(args.caption_dir, args.bilingual, args.caption_chars)
+        if args.captions
+        else None
+    )
 
     in_stream = sd.RawInputStream(
         samplerate=in_rate,
@@ -387,12 +407,21 @@ async def run(args):
                         asyncio.create_task(controller.switch.wait()),
                         asyncio.create_task(controller.stop.wait()),
                     }
-                    done, pending = await asyncio.wait(
-                        tasks, return_when=asyncio.FIRST_COMPLETED
-                    )
-                    for t in pending:
-                        t.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
+                    try:
+                        done, _ = await asyncio.wait(
+                            tasks, return_when=asyncio.FIRST_COMPLETED
+                        )
+                    finally:
+                        # Tear down this session's tasks on every exit path — normal
+                        # turnover, language switch, reconnect, and Ctrl-C. Cancelling
+                        # while the socket is still open lets the receiver end on a
+                        # clean CancelledError instead of racing the websocket close
+                        # into an APIError; gathering (return_exceptions=True) retrieves
+                        # every result so a normal stop never surfaces as an
+                        # "exception was never retrieved" traceback.
+                        for t in tasks:
+                            t.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
                     for t in done:
                         exc = t.exception()
                         if exc and not isinstance(exc, asyncio.CancelledError):
@@ -448,6 +477,13 @@ def parse_args():
         "--caption-dir",
         default=os.environ.get("CAPTION_DIR", "captions"),
         help="Directory for caption files (env CAPTION_DIR). Default: ./captions",
+    )
+    p.add_argument(
+        "--caption-chars",
+        type=int,
+        default=int(os.environ.get("CAPTION_CHARS") or CaptionWriter.DEFAULT_MAX_CHARS),
+        help="Rolling caption window size in characters (env CAPTION_CHARS). "
+        "Smaller = fewer on-screen lines. Default: 130",
     )
     p.add_argument(
         "--bilingual",

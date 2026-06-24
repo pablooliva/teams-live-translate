@@ -187,6 +187,7 @@ reconnect logic also rides through the API's ~15-minute session cap automaticall
 | `--transcript` | Print the translated transcript to stdout. |
 | `--captions` | Captions mode: capture the mic and write transcripts to files for OBS. |
 | `--caption-dir <dir>` | Directory for caption files (env `CAPTION_DIR`). Default `./captions`. |
+| `--caption-chars <n>` | Rolling caption window size in characters (env `CAPTION_CHARS`). Smaller = fewer on-screen lines. Default `130`. |
 | `--bilingual` | Also write the original source transcript (`source.txt`). |
 | `--switch` | Enable on-the-fly target-language switching (type a code + Enter; `q` to quit). |
 | `--playback` / `--no-playback` | Force translated-audio playback on/off. Default: on in listen mode, off in captions mode. |
