@@ -31,6 +31,7 @@ command line. Run with --list-devices first to find your device names.
 import argparse
 import asyncio
 import contextlib
+import json
 import os
 import queue
 import sys
@@ -224,6 +225,237 @@ class CaptionWriter:
             self.src.end_turn()
 
 
+# Self-contained transcript page: inlined HTML/CSS/JS so the server has no static
+# assets to ship. It opens an SSE stream to /events and renders fragments live.
+_WEB_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Translation</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: flex; flex-direction: column;
+    background: #0f1115; color: #e8eaed;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    flex: 0 0 auto; display: flex; align-items: center; gap: .6rem;
+    padding: .7rem 1rem; border-bottom: 1px solid #23262d; background: #14171c;
+  }
+  header h1 { font-size: 1rem; font-weight: 600; margin: 0; color: #cfd3d8; }
+  .badge {
+    font-size: .8rem; padding: .15rem .55rem; border-radius: 999px;
+    background: #1f6feb22; color: #6ea8fe; border: 1px solid #1f6feb55;
+    text-transform: uppercase; letter-spacing: .04em;
+  }
+  .spacer { flex: 1; }
+  .dot { width: .65rem; height: .65rem; border-radius: 50%; background: #555; transition: background .3s; }
+  .dot.on { background: #2ea043; box-shadow: 0 0 6px #2ea043aa; }
+  .dot.off { background: #d29922; }
+  #feed {
+    flex: 1; overflow-y: auto; padding: 1.2rem clamp(1rem, 6vw, 6rem);
+    font-size: clamp(1.2rem, 2.6vw, 2rem); line-height: 1.5;
+  }
+  .line { margin: 0 0 .6rem; white-space: pre-wrap; word-break: break-word; color: #c2c6cc; }
+  .line.live { color: #fff; }
+  .line.live::after {
+    content: "\\258B"; margin-left: .1em; color: #6ea8fe;
+    animation: blink 1s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  footer { flex: 0 0 auto; padding: .4rem 1rem; font-size: .75rem; color: #6b7178; border-top: 1px solid #23262d; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Live Translation</h1>
+    <span class="badge" id="lang">\\2026</span>
+    <span class="spacer"></span>
+    <span class="dot" id="status" title="connection"></span>
+  </header>
+  <div id="feed"></div>
+  <footer>Auto-scrolling. Scroll up to read back; new lines resume auto-scroll.</footer>
+  <script>
+    const feed = document.getElementById('feed');
+    const langEl = document.getElementById('lang');
+    const statusEl = document.getElementById('status');
+    let liveEl = null;
+    let autoscroll = true;
+
+    feed.addEventListener('scroll', () => {
+      autoscroll = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60;
+    });
+    function toBottom() { if (autoscroll) feed.scrollTop = feed.scrollHeight; }
+
+    function ensureLive() {
+      if (!liveEl) {
+        liveEl = document.createElement('div');
+        liveEl.className = 'line live';
+        feed.appendChild(liveEl);
+      }
+      return liveEl;
+    }
+    function commitLive() {
+      if (!liveEl) return;
+      const t = liveEl.textContent.trim();
+      if (t) { liveEl.textContent = t; liveEl.className = 'line'; }
+      else { liveEl.remove(); }
+      liveEl = null;
+    }
+
+    const es = new EventSource('/events');
+    es.onopen = () => { statusEl.className = 'dot on'; };
+    es.onerror = () => { statusEl.className = 'dot off'; };
+    es.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'snapshot') {
+        feed.innerHTML = '';
+        liveEl = null;
+        (msg.history || []).forEach(line => {
+          const d = document.createElement('div');
+          d.className = 'line';
+          d.textContent = line;
+          feed.appendChild(d);
+        });
+        if (msg.current) ensureLive().textContent = msg.current;
+        if (msg.lang) langEl.textContent = msg.lang;
+        autoscroll = true;
+        feed.scrollTop = feed.scrollHeight;
+      } else if (msg.type === 'frag') {
+        ensureLive().textContent += msg.text;
+        toBottom();
+      } else if (msg.type === 'turn') {
+        commitLive();
+        toBottom();
+      } else if (msg.type === 'lang') {
+        langEl.textContent = msg.lang;
+      }
+    };
+  </script>
+</body>
+</html>
+"""
+
+
+class WebBroadcaster:
+    """Serves a live transcript webpage and streams fragments to it over SSE.
+
+    A second sink alongside the OBS file: the embedded aiohttp server runs as a
+    task on the main asyncio loop, and publish() fans each fragment out to every
+    connected browser through its own asyncio.Queue. The put is non-blocking, so
+    a stalled browser is dropped rather than ever back-pressuring translation.
+
+    Unlike the OBS roll-up (a fixed 3-line block, tuned to stop OBS reflow
+    jitter), the browser receives the *raw* fragment stream and builds a full,
+    auto-scrolling transcript client-side — so the page isn't bound to that
+    caption geometry. A bounded backlog of finished lines (plus the in-progress
+    line) is replayed to each newly connected browser as a one-off "snapshot",
+    so someone who joins mid-presentation sees recent context, not a blank page.
+    """
+
+    MAX_HISTORY = 500  # finished lines retained for the late-joiner snapshot
+
+    def __init__(self, host: str, port: int, lang: str):
+        self.host = host
+        self.port = port
+        self.lang = lang
+        self.history: list[str] = []  # finished lines (bounded)
+        self.current = ""             # the in-progress line, still growing
+        self._clients: "set[asyncio.Queue[str]]" = set()
+        self._runner = None
+
+    async def start(self) -> None:
+        # Lazy import so only --web requires aiohttp to be installed.
+        from aiohttp import web
+
+        app = web.Application()
+        app.router.add_get("/", self._handle_index)
+        app.router.add_get("/events", self._handle_events)
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        await web.TCPSite(self._runner, self.host, self.port).start()
+
+    async def stop(self) -> None:
+        if self._runner is not None:
+            await self._runner.cleanup()
+
+    async def _handle_index(self, request):
+        from aiohttp import web
+
+        return web.Response(text=_WEB_PAGE, content_type="text/html")
+
+    async def _handle_events(self, request):
+        from aiohttp import web
+
+        resp = web.StreamResponse(
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",  # tell proxies not to buffer the stream
+            }
+        )
+        await resp.prepare(request)
+        q: "asyncio.Queue[str]" = asyncio.Queue(maxsize=2000)
+        # Register the queue and capture the snapshot with NO await in between, so
+        # the snapshot and the live queue partition the event stream exactly: any
+        # fragment after this instant goes to the queue, everything before is in
+        # the snapshot — no gap, no duplicate.
+        self._clients.add(q)
+        snapshot = json.dumps(
+            {"type": "snapshot", "lang": self.lang, "history": self.history, "current": self.current},
+            ensure_ascii=False,
+        )
+        try:
+            await resp.write(f"data: {snapshot}\n\n".encode("utf-8"))
+            while True:
+                try:
+                    data = await asyncio.wait_for(q.get(), timeout=15)
+                    await resp.write(f"data: {data}\n\n".encode("utf-8"))
+                except asyncio.TimeoutError:
+                    await resp.write(b": ping\n\n")  # heartbeat: keep idle proxies open
+        except (asyncio.CancelledError, OSError, RuntimeError):
+            pass  # browser navigated away / connection dropped
+        finally:
+            self._clients.discard(q)
+        return resp
+
+    def _publish(self, event: dict) -> None:
+        if not self._clients:
+            return
+        data = json.dumps(event, ensure_ascii=False)
+        for q in self._clients:
+            try:
+                q.put_nowait(data)
+            except asyncio.QueueFull:
+                pass  # slow/dead client: drop rather than block translation
+
+    def set_language(self, lang: str) -> None:
+        if lang == self.lang:
+            return
+        self.lang = lang
+        self._publish({"type": "lang", "lang": lang})
+
+    def add_translation(self, text: str) -> None:
+        # Fold stray newlines/tabs to spaces (the model emits them mid-stream),
+        # matching what the OBS roll-up does, so a fragment stays one logical line.
+        clean = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+        self.current += clean
+        self._publish({"type": "frag", "text": clean})
+
+    def end_turn(self) -> None:
+        line = self.current.strip()
+        if line:
+            self.history.append(line)
+            if len(self.history) > self.MAX_HISTORY:
+                self.history = self.history[-self.MAX_HISTORY :]
+        self.current = ""
+        self._publish({"type": "turn"})
+
+
 class Controller:
     """Shared control state between the stdin reader thread and the asyncio loop."""
 
@@ -289,7 +521,7 @@ async def _sender(session, encode: CaptureEncoder):
             )
 
 
-async def _receiver(session, decode, caption, show_transcript: bool):
+async def _receiver(session, decode, caption, broadcaster, show_transcript: bool):
     """Receive translated audio + transcripts; play audio and/or write captions.
 
     Returns when the session ends (server close / 15-min cap), which the run loop
@@ -316,11 +548,15 @@ async def _receiver(session, decode, caption, show_transcript: bool):
         if out_tx and out_tx.text:
             if caption is not None:
                 caption.add_translation(out_tx.text)
+            if broadcaster is not None:
+                broadcaster.add_translation(out_tx.text)
             if show_transcript:
                 print(out_tx.text, end="", flush=True)
         if getattr(sc, "turn_complete", False):
             if caption is not None:
                 caption.end_turn()
+            if broadcaster is not None:
+                broadcaster.end_turn()
             if show_transcript:
                 print(flush=True)
 
@@ -398,6 +634,10 @@ async def run(args):
         else None
     )
 
+    broadcaster = (
+        WebBroadcaster(args.web_host, args.web_port, args.target) if args.web else None
+    )
+
     in_stream = sd.RawInputStream(
         samplerate=in_rate,
         blocksize=in_rate // 10,  # ~100 ms chunks
@@ -434,12 +674,20 @@ async def run(args):
     if caption is not None:
         kind = "bilingual (source + translation)" if args.bilingual else "translation only"
         lines.append(f"  captions: {os.path.abspath(args.caption_dir)}  ({kind})")
+    if broadcaster is not None:
+        lines.append(
+            f"  web: http://{args.web_host}:{args.web_port}  "
+            "(open in a browser; share with others via a tunnel — see README)"
+        )
     if args.switch:
         lines.append("  switch: type a language code + Enter to change target, 'q' to quit")
     lines.append("Ctrl-C to stop.\n")
     print("\n".join(lines), flush=True)
 
-    with contextlib.ExitStack() as stack:
+    async with contextlib.AsyncExitStack() as stack:
+        if broadcaster is not None:
+            await broadcaster.start()
+            stack.push_async_callback(broadcaster.stop)
         stack.enter_context(in_stream)
         if out_stream is not None:
             stack.enter_context(out_stream)
@@ -449,6 +697,8 @@ async def run(args):
         while not controller.stop.is_set():
             controller.switch.clear()
             target = controller.target
+            if broadcaster is not None:
+                broadcaster.set_language(target)
             _drain_capture_queue()
             config = _build_config(target, args.echo)
             try:
@@ -457,7 +707,7 @@ async def run(args):
                     tasks = {
                         asyncio.create_task(_sender(session, encode)),
                         asyncio.create_task(
-                            _receiver(session, decode, caption, args.transcript)
+                            _receiver(session, decode, caption, broadcaster, args.transcript)
                         ),
                         asyncio.create_task(controller.switch.wait()),
                         asyncio.create_task(controller.stop.wait()),
@@ -565,6 +815,25 @@ def parse_args():
         "--switch",
         action="store_true",
         help="Enable on-the-fly target-language switching: type a code + Enter (reconnects).",
+    )
+    # --- Web mode ----------------------------------------------------------
+    p.add_argument(
+        "--web",
+        action="store_true",
+        help="Serve a live transcript webpage (SSE) several viewers can open at once. "
+        "Independent of --captions; pair with a tunnel to share with remote participants.",
+    )
+    p.add_argument(
+        "--web-host",
+        default=os.environ.get("WEB_HOST", "127.0.0.1"),
+        help="Web server bind address (env WEB_HOST). Default 127.0.0.1 (localhost only — "
+        "pair with a tunnel). Set 0.0.0.0 to expose directly on your LAN.",
+    )
+    p.add_argument(
+        "--web-port",
+        type=int,
+        default=int(os.environ.get("WEB_PORT") or 8080),
+        help="Web server port (env WEB_PORT). Default 8080.",
     )
     return p.parse_args()
 

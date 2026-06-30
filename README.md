@@ -15,6 +15,10 @@ It has two modes:
   that [OBS](https://obsproject.com/) reads, so you can present with live translated
   captions baked into your Teams video. See [Captions mode](#captions-mode-presenting-with-live-captions).
 
+Either mode can additionally broadcast the live transcript to a **webpage**
+(`--web`) that remote participants open in their own browser and read at their own
+pace — see [Web mode](#web-mode-live-transcript-for-remote-viewers).
+
 The source language is auto-detected (70+ languages); the target language is
 configurable and can be **changed on the fly** while running (`--switch`).
 
@@ -206,6 +210,62 @@ reconnect logic also rides through the API's ~15-minute session cap automaticall
 > your captions instead — which also gives you full control over styling and
 > placement.
 
+## Web mode (live transcript for remote viewers)
+
+`--web` serves a small webpage that streams the live translated transcript to any
+number of browsers at once — so remote Teams participants can read along on their
+own screen, at their own pace, with full scroll-back, instead of relying on the
+shared OBS caption. It's an extra **output**, not a separate capture mode: add
+`--web` to either listen or captions mode and it taps the same translation stream.
+
+```sh
+# OBS captions *and* a live web transcript, with on-the-fly language switching:
+uv run --env-file .env teams-live-translate --captions --web --switch --target es
+
+# Web transcript only (no OBS files):
+uv run --env-file .env teams-live-translate --web --target es
+```
+
+By default the server binds to `127.0.0.1:8080`; open <http://127.0.0.1:8080>
+locally to check it. The page opens a [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
+stream and renders an auto-scrolling transcript client-side — scroll up to read
+back, and new lines resume auto-scroll. A viewer who joins mid-talk gets the recent
+transcript replayed (not a blank page), and the current target language shows in the
+header, updating live when you `--switch`.
+
+Unlike the OBS caption (a fixed 3-line roll-up tuned to stop OBS reflow jitter), the
+web page receives the raw fragment stream and builds a full transcript, so it isn't
+bound to that geometry. Read-only text viewers are nearly free, so "several
+participants" — or dozens — is no problem; the payload is a few bytes a few times
+per second.
+
+### Sharing with remote participants (tunnel)
+
+`127.0.0.1` is reachable only on your own machine, so remote attendees need a public
+URL. The quickest route is a **tunnel** that forwards a public HTTPS address to your
+local server. With the script running (`--web`), in a second terminal:
+
+```sh
+# Cloudflare Tunnel (no account needed for a quick share):
+cloudflared tunnel --url http://localhost:8080
+
+# …or ngrok:
+ngrok http 8080
+```
+
+Either prints a public `https://…` URL — paste it into the Teams chat and
+participants open it in any browser. Stop the tunnel to revoke access.
+
+> **Heads-up:** a tunnel routes the transcript text through a third-party edge, and
+> some corporate IT policies restrict running tunnels on managed laptops — worth
+> checking for work meetings. For a persistent, branded link you'd instead deploy a
+> small relay the laptop pushes to (more setup, transcript transits a server you
+> operate); ask if you want that wired up.
+
+> To share on your **LAN** instead (everyone on the same office network), set
+> `--web-host 0.0.0.0` and give people `http://<your-LAN-IP>:8080`. No tunnel needed,
+> but it won't reach anyone off the network — so not the remote-Teams case.
+
 ## Flags
 
 | Flag | Description |
@@ -222,6 +282,9 @@ reconnect logic also rides through the API's ~15-minute session cap automaticall
 | `--caption-lines <n>` | Number of visible caption lines — the roll-up depth (env `CAPTION_LINES`). Default `3`. |
 | `--bilingual` | Also write the original source transcript (`source.txt`). |
 | `--switch` | Enable on-the-fly target-language switching (type a code + Enter; `q` to quit). |
+| `--web` | Serve a live transcript webpage (SSE) for remote viewers. Combine with listen or captions mode. |
+| `--web-host <addr>` | Web server bind address (env `WEB_HOST`). Default `127.0.0.1` (localhost; pair with a tunnel). `0.0.0.0` to expose on your LAN. |
+| `--web-port <n>` | Web server port (env `WEB_PORT`). Default `8080`. |
 | `--playback` / `--no-playback` | Force translated-audio playback on/off. Default: on in listen mode, off in captions mode. |
 | `--echo` | Output audio even when the input already matches the target language (default on). |
 
